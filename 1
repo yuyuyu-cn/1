@@ -1,0 +1,24 @@
+python - <<'PY'
+import os
+import ssl
+
+cert = os.environ["AD_CLIENT_CERT"]
+key = os.environ["AD_CLIENT_KEY"]
+ca = os.environ["AD_CA_CERT"]
+
+# 测试 CA
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+try:
+    ctx.load_verify_locations(cafile=ca)
+    print("[OK] CA certificate loaded")
+except Exception as e:
+    print("[FAIL] CA certificate:", repr(e))
+
+# 测试客户端证书和私钥
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+try:
+    ctx.load_cert_chain(certfile=cert, keyfile=key)
+    print("[OK] Client certificate and key loaded")
+except Exception as e:
+    print("[FAIL] Client certificate/key:", repr(e))
+PY
