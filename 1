@@ -1,9 +1,120 @@
-python - <<'PY'
-from server import app
 
-print("===== Registered API Routes =====")
+---
+# 1. Define application paths
 
-for rule in sorted(app.url_map.iter_rules(), key=lambda r: r.rule):
-    methods = ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"}))
-    print(f"{methods:25} {rule.rule}")
-PY
+- name: Define application project directory
+  ansible.builtin.set_fact:
+    app_project_dir: "{{ app_install_dir | default(ansible_env.HOME ~ '/app') }}"
+
+- name: Define application runtime configuration
+  ansible.builtin.set_fact:
+    app_python: "{{ app_python_path | default(app_project_dir ~ '/venv/bin/python') }}"
+    app_server_cert: "{{ app_server_cert_path | default(ansible_env.HOME ~ '/certs/server.crt') }}"
+    app_server_key: "{{ app_server_key_path | default(ansible_env.HOME ~ '/certs/server.key') }}"
+    app_ca_cert: "{{ app_ca_cert_path | default(ansible_env.HOME ~ '/certs/ca.crt') }}"
+    app_systemd_dir: "{{ ansible_env.HOME }}/.config/systemd/user"
+    app_port: "{{ service_port | default(8443) }}"
+
+# 2. Check required files
+
+- name: Check application files
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  loop:
+    - "{{ app_project_dir }}/server.py"
+    - "{{ app_project_dir }}/.env"
+    - "{{ app_project_dir }}/gunicorn.conf.py"
+    - "{{ app_python }}"
+    - "{{ app_server_cert }}"
+    - "{{ app_server_key }}"
+    - "{{ app_ca_cert }}"
+  register: app_file_checks
+
+- name: Verify application files exist
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+    fail_msg: "Required file not found: {{ item.item }}"
+  loop: "{{ app_file_checks.results }}"
+
+# 3. Check user systemd
+
+- name: Get current user UID
+  ansible.builtin.command: id -u
+  register: app_uid
+  changed_when: false
+
+- name: Check user linger
+  ansible.builtin.command:
+    argv:
+      - loginctl
+      - show-user
+      - "{{ ansible_user_id }}"
+      - --property=Linger
+      - --value
+  register: app_linger
+  changed_when: false
+
+- name: Verify user linger is enabled
+  ansible.builtin.assert:
+    that:
+      - app_linger.stdout | trim == 'yes'
+    fail_msg: "User linger must be enabled for persistent application service."
+
+- name: Create user systemd directory
+  ansible.builtin.file:
+    path: "{{ app_systemd_dir }}"
+    state: directory
+    mode: "0700"
+
+# 4. Create application service
+
+- name: Configure application systemd service
+  ansible.builtin.copy:
+    dest: "{{ app_systemd_dir }}/app.service"
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Application API Service
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=simple
+      WorkingDirectory={{ app_project_dir }}
+      Environment=PYTHONUNBUFFERED=1
+      ExecStart={{ app_python }} -m gunicorn --bind 127.0.0.1:{{ app_port }} --certfile {{ app_server_cert }} --keyfile {{ app_server_key }} --ca-certs {{ app_ca_cert }} --cert-reqs 1 -c gunicorn.conf.py server:app
+      Restart=always
+      RestartSec=5
+      TimeoutStopSec=30
+      KillSignal=SIGTERM
+
+      [Install]
+      WantedBy=default.target
+  register: app_unit
+
+# 5. Start application
+
+- name: Start application service
+  ansible.builtin.systemd_service:
+    name: app.service
+    scope: user
+    daemon_reload: true
+    enabled: true
+    state: "{{ 'restarted' if app_unit.changed else 'started' }}"
+  environment:
+    XDG_RUNTIME_DIR: "/run/user/{{ app_uid.stdout | trim }}"
+    DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/user/{{ app_uid.stdout | trim }}/bus"
+
+# 6. Verify service
+
+- name: Wait for application HTTPS port
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ app_port }}"
+    state: started
+    timeout: 120
+
+- name: Print deployment result
+  ansible.builtin.debug:
+    msg: "Application started successfully on port {{ app_port }}"
